@@ -1,6 +1,7 @@
 import { createMcpHandler } from "mcp-handler";
 import { z } from "zod";
-import { describeTimeline, readSession } from "@/lib/store";
+import { resolveScreen } from "@/lib/resolve";
+import { describeTimeline, putTrace } from "@/lib/store";
 import { inspect } from "@/lib/vision";
 import { createTicket, zendeskConfigured } from "@/lib/zendesk";
 
@@ -26,7 +27,7 @@ const handler = createMcpHandler(
         "the start of a call or to check what the customer was doing a moment ago.",
       { session_id: z.string().describe("The support session id from your system prompt.") },
       async ({ session_id }) => {
-        const state = await readSession(session_id);
+        const { state } = await resolveScreen(session_id);
         return text(describeTimeline(state));
       },
     );
@@ -44,7 +45,17 @@ const handler = createMcpHandler(
           .describe("What you need to know about the screen, e.g. 'what does the red banner say?'"),
       },
       async ({ session_id, question }) => {
-        const state = await readSession(session_id);
+        const resolved = await resolveScreen(session_id);
+        const state = resolved.state;
+
+        await putTrace({
+          at: Date.now(),
+          route: "mcp/look_at_screen",
+          via: resolved.via,
+          sessionId: resolved.sessionId,
+          screen: state.frame ? "attached" : "none",
+          note: resolved.note,
+        });
 
         if (!state.frame) {
           return text("The customer isn't sharing their screen right now, so I can't see anything.");
@@ -79,7 +90,7 @@ const handler = createMcpHandler(
         if (!zendeskConfigured()) {
           return text("Zendesk isn't connected in this environment, so I couldn't file the ticket.");
         }
-        const state = await readSession(session_id);
+        const { state } = await resolveScreen(session_id);
         try {
           const ticket = await createTicket({ subject, summary, resolution, frame: state.frame });
           return text(`Ticket #${ticket.id} has been created in Zendesk: ${ticket.url}`);

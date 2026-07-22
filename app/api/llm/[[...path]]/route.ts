@@ -1,5 +1,6 @@
 import { attachScreen, extractSessionId, type Message } from "@/lib/inject";
-import { describeTimeline, readSession } from "@/lib/store";
+import { resolveScreen } from "@/lib/resolve";
+import { describeTimeline, putTrace } from "@/lib/store";
 
 /**
  * The live-sight proxy. This is what makes the agent actually see.
@@ -39,18 +40,32 @@ export async function POST(request: Request) {
   }
 
   const messages = (body.messages as Message[] | undefined) ?? [];
-  const sessionId = extractSessionId(body, new URL(request.url).searchParams);
+  const claimed = extractSessionId(body, new URL(request.url).searchParams);
+  const resolved = await resolveScreen(claimed);
 
   let patched = messages;
   let sawScreen = false;
 
-  if (sessionId) {
-    const state = await readSession(sessionId);
-    if (state.frame && Date.now() - state.frameAt < MAX_FRAME_AGE_MS) {
-      patched = attachScreen(messages, state.frame, describeTimeline(state));
-      sawScreen = true;
-    }
+  const fresh = resolved.state.frame && Date.now() - resolved.state.frameAt < MAX_FRAME_AGE_MS;
+  if (fresh && resolved.state.frame) {
+    patched = attachScreen(messages, resolved.state.frame, describeTimeline(resolved.state));
+    sawScreen = true;
   }
+
+  const sessionId = resolved.sessionId;
+
+  // Recorded whether it worked or not — this is the only window into what
+  // ElevenLabs actually sent us. Read it at /api/debug.
+  await putTrace({
+    at: Date.now(),
+    route: "llm",
+    via: claimed ? resolved.via : `no-id/${resolved.via}`,
+    sessionId,
+    screen: sawScreen ? "attached" : "none",
+    note:
+      resolved.note ??
+      (fresh ? undefined : "A frame exists but is older than 30s — screen share may have stopped."),
+  });
 
   // Strip our own routing fields; forward everything else — tools, tool_choice,
   // temperature, stream — exactly as ElevenLabs sent it.

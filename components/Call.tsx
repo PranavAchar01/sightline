@@ -120,8 +120,13 @@ function CallSurface() {
       await startSession({
         agentId: process.env.NEXT_PUBLIC_ELEVENLABS_AGENT_ID!,
         connectionType: "webrtc",
-        // Reaches the live-sight proxy two ways: as a custom LLM extra body field,
-        // and — belt and braces — embedded in the resolved system prompt.
+        // Three independent routes to the proxy, because any one of them can be
+        // defeated by dashboard config:
+        //   customLlmExtraBody — goes straight into the proxy's request body. This
+        //     is the reliable one; it needs nothing configured in the dashboard.
+        //   dynamicVariables   — resolves {{session_id}} in the system prompt, which
+        //     is what the MCP tools read, and what the proxy scrapes as a fallback.
+        customLlmExtraBody: { session_id: sessionId.current },
         dynamicVariables: { session_id: sessionId.current },
       });
     } catch {

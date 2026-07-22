@@ -55,6 +55,24 @@ const framePath = (id: string) => `sessions/${id}/frame.json`;
 const captionPath = (id: string) => `sessions/${id}/captions.json`;
 const redisKey = (id: string) => `sightline:session:${id}`;
 
+const LATEST_PATH = "sessions/_latest.json";
+const LATEST_KEY = "sightline:latest";
+const DEBUG_PATH = "debug/last.json";
+const DEBUG_KEY = "sightline:debug";
+
+type Latest = { sessionId: string; at: number };
+
+/** Diagnostic breadcrumb — what the last inbound agent call actually resolved to. */
+export type Trace = {
+  at: number;
+  route: string;
+  /** Where the session id came from, or why it couldn't be found. */
+  via: string;
+  sessionId: string | null;
+  screen: "attached" | "none";
+  note?: string;
+};
+
 async function blobRead<T>(pathname: string): Promise<T | null> {
   try {
     // useCache:false is essential — a CDN-cached frame would mean the agent looks at
@@ -104,7 +122,65 @@ export async function readSession(sessionId: string): Promise<ScreenState> {
   return hit.state;
 }
 
+/** Remember which session last pushed a frame, so a lost id can still be recovered. */
+async function markLatest(sessionId: string): Promise<void> {
+  const value: Latest = { sessionId, at: Date.now() };
+  if (redis) {
+    await redis.set(LATEST_KEY, value, { ex: TTL_SECONDS });
+    return;
+  }
+  if (blobEnabled) {
+    await blobWrite(LATEST_PATH, value);
+    return;
+  }
+  latestMemory = value;
+}
+
+let latestMemory: Latest | null = null;
+
+/**
+ * The session id the browser most recently pushed a frame for.
+ *
+ * This exists because every route by which an agent tells us its session id runs
+ * through ElevenLabs' dashboard config, and any of them can be silently
+ * misconfigured — the symptom being an agent that insists no screen is shared while
+ * the browser is visibly streaming.
+ *
+ * Falling back to "the session that is actually live right now" is correct for one
+ * concurrent call and wrong for many, so it is used only when the id is missing or
+ * unknown, and every use is recorded in the trace.
+ */
+export async function latestSessionId(): Promise<string | null> {
+  let value: Latest | null = null;
+  if (redis) value = await redis.get<Latest>(LATEST_KEY);
+  else if (blobEnabled) value = await blobRead<Latest>(LATEST_PATH);
+  else value = latestMemory;
+
+  if (!value) return null;
+  return Date.now() - value.at < TTL_SECONDS * 1000 ? value.sessionId : null;
+}
+
+export async function putTrace(trace: Trace): Promise<void> {
+  try {
+    if (redis) await redis.set(DEBUG_KEY, trace, { ex: TTL_SECONDS });
+    else if (blobEnabled) await blobWrite(DEBUG_PATH, trace);
+    else traceMemory = trace;
+  } catch {
+    // Diagnostics must never break a live call.
+  }
+}
+
+let traceMemory: Trace | null = null;
+
+export async function readTrace(): Promise<Trace | null> {
+  if (redis) return (await redis.get<Trace>(DEBUG_KEY)) ?? null;
+  if (blobEnabled) return await blobRead<Trace>(DEBUG_PATH);
+  return traceMemory;
+}
+
 export async function putFrame(sessionId: string, frame: string): Promise<void> {
+  await markLatest(sessionId);
+
   if (redis) {
     const state = await readSession(sessionId);
     await redis.set(redisKey(sessionId), { ...state, frame, frameAt: Date.now() }, { ex: TTL_SECONDS });
