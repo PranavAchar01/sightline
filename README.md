@@ -109,3 +109,13 @@ curl -X POST https://<your-deployment>/api/mcp -H "Authorization: Bearer $MCP_SH
 ```
 
 Should list `get_screen_context`, `look_at_screen`, and `create_support_ticket`.
+
+## Health check
+
+```bash
+curl -s https://sightline-nine.vercel.app/api/health
+```
+
+Reports which env vars are missing and — critically — whether the session bridge is
+on Redis or the in-memory fallback. Every misconfiguration here presents identically
+from the ElevenLabs side: the agent just asks the customer to describe their screen.
