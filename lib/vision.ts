@@ -1,6 +1,15 @@
 import OpenAI from "openai";
 
-const MODEL = process.env.OPENAI_VISION_MODEL ?? "gpt-5.2";
+/**
+ * Benchmarked against a realistic support screenshot (see docs/BENCHMARKS.md):
+ * gpt-5.4-mini captions in ~0.9s and reads exact reference numbers correctly at high
+ * detail in ~1.0s — faster *and* more accurate than both gpt-5.4-nano, which misread
+ * "Acme" as "Acne", and gpt-5.2, which took 2-3x longer for no gain.
+ */
+const MODEL = process.env.OPENAI_VISION_MODEL ?? "gpt-5.4-mini";
+
+/** Everything here gets spoken aloud, so markdown would be read out as punctuation. */
+const PLAIN = " Reply in plain spoken English with no markdown, asterisks or formatting.";
 
 /**
  * Lazy: constructing the client at module scope throws during `next build`, which
@@ -43,9 +52,10 @@ export function caption(frame: string): Promise<string> {
   return ask(
     frame,
     "One sentence: what application or page is this, and what is the user doing? " +
-      "Quote any visible error message, status, or banner text verbatim. No preamble.",
+      "Quote any visible error message, status, or banner text verbatim. No preamble." +
+      PLAIN,
     "low",
-    90,
+    120,
   );
 }
 
@@ -58,8 +68,9 @@ export function inspect(frame: string, question: string): Promise<string> {
     "You are looking at a screenshot of a customer's screen during a live support call. " +
       `Answer this precisely and briefly, in one or two sentences: ${question}\n\n` +
       "Read any relevant text exactly as it appears. If the answer is not visible on " +
-      "screen, say so plainly rather than guessing.",
+      "screen, say so plainly rather than guessing." +
+      PLAIN,
     "high",
-    200,
+    250,
   );
 }

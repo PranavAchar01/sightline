@@ -80,7 +80,9 @@ export function attachScreen(
         type: "text",
         text:
           "[LIVE SCREEN] The image below is the customer's screen right now. " +
-          "Use it directly — do not ask them to describe it.\n\n" +
+          "Use it directly — do not ask them to describe it. Reply in plain spoken " +
+          "English with no markdown, asterisks or formatting; every word is read " +
+          "aloud.\n\n" +
           timeline,
       },
       { type: "image_url", image_url: { url: frame, detail: "low" } },

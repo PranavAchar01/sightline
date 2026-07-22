@@ -1,47 +1,101 @@
+import { del, get, put } from "@vercel/blob";
 import { Redis } from "@upstash/redis";
 
 /**
  * The session bridge.
  *
- * ElevenLabs calls our MCP server from *their* backend, so the MCP server has no
- * access to the browser that is sharing its screen. The browser pushes frames and
- * ambient captions in here keyed by session id; the MCP server reads them back out.
+ * ElevenLabs calls the Custom LLM proxy and the MCP server from *their* backend, so
+ * neither has access to the browser that is sharing its screen. The browser pushes
+ * frames and captions in here keyed by session id; the proxy reads them back out.
  *
- * In production this MUST be Redis — Vercel will route the browser's POST and
- * ElevenLabs' MCP call to different serverless instances, so a module-level Map
- * would silently return "no screen shared". The in-memory fallback exists only so
- * `next dev` works without provisioning anything.
+ * On Vercel this cannot be process memory. `POST /api/session/:id` and `POST /api/llm`
+ * are different route handlers, so they are different function instances — always.
+ * The symptom of getting this wrong is an agent that politely asks the customer to
+ * describe their screen while the browser insists it is streaming perfectly.
+ *
+ * Three backends, in order of preference:
+ *   Redis  — fastest, if UPSTASH_REDIS_REST_URL is configured
+ *   Blob   — durable and provisioned by default here; ~200ms reads
+ *   memory — `next dev` only, so the repo runs with zero setup
+ *
+ * Frame and captions live in separate keys on purpose. Heartbeats rewrite only the
+ * frame, which avoids a read-modify-write of ~150KB every few seconds.
  */
 
 export type ScreenState = {
   /** Latest frame as a JPEG data URI. */
   frame: string | null;
   frameAt: number;
-  /** Rolling ambient captions, oldest first, capped at CAPTION_LIMIT. */
+  /** Rolling captions, oldest first, capped at CAPTION_LIMIT. */
   captions: { text: string; at: number }[];
 };
 
 const TTL_SECONDS = 300;
 const CAPTION_LIMIT = 12;
-
 const EMPTY: ScreenState = { frame: null, frameAt: 0, captions: [] };
 
-const url = process.env.UPSTASH_REDIS_REST_URL ?? process.env.KV_REST_API_URL;
-const token = process.env.UPSTASH_REDIS_REST_TOKEN ?? process.env.KV_REST_API_TOKEN;
+const redisUrl = process.env.UPSTASH_REDIS_REST_URL ?? process.env.KV_REST_API_URL;
+const redisToken = process.env.UPSTASH_REDIS_REST_TOKEN ?? process.env.KV_REST_API_TOKEN;
+const redis = redisUrl && redisToken ? new Redis({ url: redisUrl, token: redisToken }) : null;
 
-const redis = url && token ? new Redis({ url, token }) : null;
+const blobEnabled = Boolean(process.env.BLOB_READ_WRITE_TOKEN);
 
-export const usingRedis = redis !== null;
+export const backend: "redis" | "blob" | "memory" = redis
+  ? "redis"
+  : blobEnabled
+    ? "blob"
+    : "memory";
+
+type Frame = { frame: string; frameAt: number };
+type Captions = { captions: ScreenState["captions"] };
 
 const memory = new Map<string, { state: ScreenState; expires: number }>();
 
-const key = (sessionId: string) => `sightline:session:${sessionId}`;
+const framePath = (id: string) => `sessions/${id}/frame.json`;
+const captionPath = (id: string) => `sessions/${id}/captions.json`;
+const redisKey = (id: string) => `sightline:session:${id}`;
+
+async function blobRead<T>(pathname: string): Promise<T | null> {
+  try {
+    // useCache:false is essential — a CDN-cached frame would mean the agent looks at
+    // a screen the customer left thirty seconds ago.
+    const result = await get(pathname, { access: "private", useCache: false });
+    if (!result?.stream) return null;
+    return JSON.parse(await new Response(result.stream).text()) as T;
+  } catch {
+    return null;
+  }
+}
+
+async function blobWrite(pathname: string, value: unknown): Promise<void> {
+  await put(pathname, JSON.stringify(value), {
+    access: "private",
+    contentType: "application/json",
+    allowOverwrite: true,
+    addRandomSuffix: false,
+    cacheControlMaxAge: 0,
+  });
+}
 
 export async function readSession(sessionId: string): Promise<ScreenState> {
   if (redis) {
-    const state = await redis.get<ScreenState>(key(sessionId));
-    return state ?? EMPTY;
+    return (await redis.get<ScreenState>(redisKey(sessionId))) ?? EMPTY;
   }
+
+  if (blobEnabled) {
+    const [frame, captions] = await Promise.all([
+      blobRead<Frame>(framePath(sessionId)),
+      blobRead<Captions>(captionPath(sessionId)),
+    ]);
+    if (!frame && !captions) return EMPTY;
+    const fresh = frame && Date.now() - frame.frameAt < TTL_SECONDS * 1000;
+    return {
+      frame: fresh ? frame.frame : null,
+      frameAt: fresh ? frame.frameAt : 0,
+      captions: captions?.captions ?? [],
+    };
+  }
+
   const hit = memory.get(sessionId);
   if (!hit || hit.expires < Date.now()) {
     memory.delete(sessionId);
@@ -50,28 +104,58 @@ export async function readSession(sessionId: string): Promise<ScreenState> {
   return hit.state;
 }
 
-async function writeSession(sessionId: string, state: ScreenState): Promise<void> {
+export async function putFrame(sessionId: string, frame: string): Promise<void> {
   if (redis) {
-    await redis.set(key(sessionId), state, { ex: TTL_SECONDS });
+    const state = await readSession(sessionId);
+    await redis.set(redisKey(sessionId), { ...state, frame, frameAt: Date.now() }, { ex: TTL_SECONDS });
     return;
   }
-  memory.set(sessionId, { state, expires: Date.now() + TTL_SECONDS * 1000 });
-}
 
-export async function putFrame(sessionId: string, frame: string): Promise<void> {
+  if (blobEnabled) {
+    // No read first — this is the hot path, called on every heartbeat.
+    await blobWrite(framePath(sessionId), { frame, frameAt: Date.now() });
+    return;
+  }
+
   const state = await readSession(sessionId);
-  await writeSession(sessionId, { ...state, frame, frameAt: Date.now() });
+  memory.set(sessionId, {
+    state: { ...state, frame, frameAt: Date.now() },
+    expires: Date.now() + TTL_SECONDS * 1000,
+  });
 }
 
 export async function putCaption(sessionId: string, text: string): Promise<void> {
   const state = await readSession(sessionId);
   const captions = [...state.captions, { text, at: Date.now() }].slice(-CAPTION_LIMIT);
-  await writeSession(sessionId, { ...state, captions });
+
+  if (redis) {
+    await redis.set(redisKey(sessionId), { ...state, captions }, { ex: TTL_SECONDS });
+    return;
+  }
+  if (blobEnabled) {
+    await blobWrite(captionPath(sessionId), { captions });
+    return;
+  }
+  memory.set(sessionId, {
+    state: { ...state, captions },
+    expires: Date.now() + TTL_SECONDS * 1000,
+  });
 }
 
 export async function endSession(sessionId: string): Promise<void> {
-  if (redis) await redis.del(key(sessionId));
-  else memory.delete(sessionId);
+  if (redis) {
+    await redis.del(redisKey(sessionId));
+    return;
+  }
+  if (blobEnabled) {
+    // Best effort — the TTL check in readSession is the real guarantee.
+    await Promise.all([
+      del(framePath(sessionId)).catch(() => {}),
+      del(captionPath(sessionId)).catch(() => {}),
+    ]);
+    return;
+  }
+  memory.delete(sessionId);
 }
 
 /** Human-readable timeline for `get_screen_context` — no vision call, so it's instant. */
@@ -82,9 +166,6 @@ export function describeTimeline(state: ScreenState): string {
       : "No screen is currently being shared.";
   }
   const now = Date.now();
-  const lines = state.captions.map((c) => {
-    const secondsAgo = Math.round((now - c.at) / 1000);
-    return `- ${secondsAgo}s ago: ${c.text}`;
-  });
+  const lines = state.captions.map((c) => `- ${Math.round((now - c.at) / 1000)}s ago: ${c.text}`);
   return `What has been on the customer's screen recently (oldest first):\n${lines.join("\n")}`;
 }

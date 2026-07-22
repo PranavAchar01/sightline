@@ -1,4 +1,4 @@
-import { usingRedis } from "@/lib/store";
+import { backend } from "@/lib/store";
 
 /**
  * One request that tells you why the agent is blind.
@@ -11,7 +11,7 @@ export async function GET() {
     openai: Boolean(process.env.OPENAI_API_KEY),
     agentId: Boolean(process.env.NEXT_PUBLIC_ELEVENLABS_AGENT_ID),
     // The one that silently breaks production while working perfectly in dev.
-    sessionBridge: usingRedis ? "redis" : "in-memory",
+    sessionBridge: backend,
     customLlmAuth: Boolean(process.env.CUSTOM_LLM_API_KEY),
     mcpAuth: Boolean(process.env.MCP_SHARED_SECRET),
     zendesk: Boolean(
@@ -24,10 +24,11 @@ export async function GET() {
   const blockers: string[] = [];
   if (!checks.openai) blockers.push("OPENAI_API_KEY is unset — the agent cannot see or think.");
   if (!checks.agentId) blockers.push("NEXT_PUBLIC_ELEVENLABS_AGENT_ID is unset — no call can start.");
-  if (checks.sessionBridge === "in-memory") {
+  if (checks.sessionBridge === "memory") {
     blockers.push(
-      "No Redis: frames and proxy reads land on different serverless instances, so " +
-        "the screen never reaches the model. Set UPSTASH_REDIS_REST_URL and _TOKEN.",
+      "Session bridge is in-memory: frames and proxy reads land on different " +
+        "serverless instances, so the screen never reaches the model. Provision a " +
+        "Vercel Blob store (BLOB_READ_WRITE_TOKEN) or Upstash Redis.",
     );
   }
 
