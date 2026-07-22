@@ -86,13 +86,20 @@ Desktop Chrome or Edge only — `getDisplayMedia()` is not supported on mobile b
 
 ## Deploy
 
-Provision **Upstash Redis** from the Vercel Marketplace first — without it the browser
-and the proxy land on different serverless instances, the proxy injects nothing, and
-the agent starts asking the customer to describe their screen.
+The session bridge needs a durable store — without one the browser and the proxy land
+on different serverless instances, the proxy injects nothing, and the agent starts
+asking the customer to describe their screen. Vercel Blob is the default:
+
+```bash
+vercel blob create-store sightline-frames --access private --yes --environment production --environment preview --environment development
+```
 
 ```bash
 vercel --prod
 ```
+
+Upstash Redis is ~200ms/turn faster and takes precedence automatically if you set
+`UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN`.
 
 ## Verify a deployment
 

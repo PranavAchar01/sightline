@@ -97,15 +97,31 @@ The response carries `X-Sightline-Screen: attached|none` and `X-Sightline-Sessio
 when something is wrong you can tell a bad API key apart from a broken bridge without
 guessing.
 
-## Why Redis is not optional in production
+## Why a durable store is not optional in production
 
-`lib/store.ts` falls back to an in-memory `Map` so `next dev` works with no setup. On
-Vercel that fallback is a trap: the browser's `POST /api/session/:id` and ElevenLabs'
-`POST /api/llm` land on **different serverless instances**, so the proxy would inject
-nothing while the browser insists it's streaming fine — and the symptom is an agent
-that politely asks you to describe your screen.
+The browser's `POST /api/session/:id` and ElevenLabs' `POST /api/llm` are different
+route handlers, which means **different serverless instances, always**. Process memory
+cannot bridge them. The symptom of getting this wrong is not an error — it's an agent
+that politely asks you to describe your screen while the browser insists it is
+streaming perfectly.
 
-Provision Upstash Redis before deploying. Frames carry a 300s TTL.
+`lib/store.ts` picks a backend at import time:
+
+| Backend | When | Notes |
+|---|---|---|
+| Redis | `UPSTASH_REDIS_REST_URL` set | Fastest; ~200ms/turn better than Blob |
+| **Blob** | `BLOB_READ_WRITE_TOKEN` set | **Default here.** Provisioned by the Vercel CLI |
+| memory | neither | `next dev` only, so a fresh clone runs with zero setup |
+
+Two details that matter on the Blob path:
+
+- **Frame and captions are separate keys.** A heartbeat rewrites only the frame, so it
+  never read-modify-writes 150KB every few seconds.
+- **Reads pass `useCache: false`.** Blob reads are CDN-cached by default, and a cached
+  frame means the agent studies a screen the customer left thirty seconds ago — the
+  exact failure this whole architecture exists to avoid.
+
+Frames carry a 300s TTL.
 
 ## MCP vs. client tools
 
