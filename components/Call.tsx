@@ -4,12 +4,19 @@ import { ConversationProvider, useConversation } from "@elevenlabs/react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createCapture, type Capture } from "@/lib/screen";
 
-/** How often we look for a change. */
-const TICK_MS = 1500;
-/** Caption at least this often even if the screen looks static. */
-const CAPTION_FLOOR_MS = 10_000;
-/** Keep the stored frame fresher than the MCP server's staleness cutoff. */
-const HEARTBEAT_MS = 5_000;
+/**
+ * More than this in flight and we're uploading faster than the network can drain.
+ * Two lets a slow caption overlap with the next heartbeat instead of stalling it.
+ */
+const MAX_IN_FLIGHT = 2;
+
+/**
+ * When the agent runs on the live-sight proxy (the default), the proxy injects the
+ * screen into every turn and pushing captions again would just duplicate tokens.
+ * Set NEXT_PUBLIC_FALLBACK_CONTEXT=1 if the agent is on a stock LLM instead, where
+ * sendContextualUpdate is the only way in.
+ */
+const FALLBACK_CONTEXT = process.env.NEXT_PUBLIC_FALLBACK_CONTEXT === "1";
 
 type Observation = { text: string; at: number };
 
@@ -26,19 +33,19 @@ export default function Call() {
 function CallSurface() {
   const capture = useRef<Capture | null>(null);
   const sessionId = useRef<string>("");
-  const lastCaption = useRef(0);
-  const lastHeartbeat = useRef(0);
-  const inFlight = useRef(false);
+  const inFlight = useRef(0);
 
   const [live, setLive] = useState(false);
   const [observations, setObservations] = useState<Observation[]>([]);
+  const [frames, setFrames] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const conversation = useConversation({
     /**
-     * The fast path. These mirror the MCP tools exactly — configure the agent with
-     * one or the other, never both. MCP is the portable connector; client tools skip
-     * a network leg and are noticeably snappier on stage.
+     * Escalation path. The proxy shows the model every screen at low detail; this
+     * pays for full detail on one frame when it needs to read exact characters.
+     * Mirrors the MCP tool of the same name — configure the agent with one or the
+     * other, never both.
      */
     clientTools: {
       look_at_screen: async ({ question }: { question: string }) => {
@@ -80,6 +87,8 @@ function CallSurface() {
   const start = useCallback(async () => {
     setError(null);
     setObservations([]);
+    setFrames(0);
+    inFlight.current = 0;
 
     const cap = createCapture();
     capture.current = cap;
@@ -96,12 +105,23 @@ function CallSurface() {
       return;
     }
 
+    // Prime the bridge before the agent can possibly ask anything, so its very
+    // first turn already has a frame to look at.
+    const first = cap.grab(1024, 0.5);
+    if (first) {
+      await fetch(`/api/session/${sessionId.current}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ frame: first, describe: true }),
+      }).catch(() => {});
+    }
+
     try {
       await startSession({
         agentId: process.env.NEXT_PUBLIC_ELEVENLABS_AGENT_ID!,
         connectionType: "webrtc",
-        // The agent's system prompt reads {{session_id}} and passes it to every tool.
-        // This is what lets a server-side MCP call find the right browser.
+        // Reaches the live-sight proxy two ways: as a custom LLM extra body field,
+        // and — belt and braces — embedded in the resolved system prompt.
         dynamicVariables: { session_id: sessionId.current },
       });
     } catch {
@@ -110,54 +130,49 @@ function CallSurface() {
     }
   }, [startSession, stop]);
 
-  // The ambient channel.
+  // The live channel: compositor-driven, not timer-driven.
   useEffect(() => {
     if (!live) return;
+    const cap = capture.current;
+    if (!cap) return;
 
-    const id = setInterval(async () => {
-      const cap = capture.current;
-      if (!cap?.isActive() || inFlight.current) return;
+    const unsubscribe = cap.subscribe(({ changed }) => {
+      if (inFlight.current >= MAX_IN_FLIGHT) return;
 
-      const now = Date.now();
-      const changed = cap.hasChanged();
-      const overdue = now - lastCaption.current > CAPTION_FLOOR_MS;
-      const needsHeartbeat = now - lastHeartbeat.current > HEARTBEAT_MS;
-
-      if (!changed && !overdue && !needsHeartbeat) return;
-
-      const describe = changed || overdue;
-      const frame = cap.grab(describe ? 1024 : 640, describe ? 0.5 : 0.4);
+      // A changed screen is worth captioning; a heartbeat only needs to refresh
+      // the stored frame so the proxy never injects something stale.
+      const frame = cap.grab(changed ? 1024 : 768, changed ? 0.5 : 0.4);
       if (!frame) return;
 
-      inFlight.current = true;
-      lastHeartbeat.current = now;
-      if (describe) lastCaption.current = now;
+      inFlight.current += 1;
+      void (async () => {
+        try {
+          const res = await fetch(`/api/session/${sessionId.current}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ frame, describe: changed }),
+          });
+          setFrames((n) => n + 1);
 
-      try {
-        const res = await fetch(`/api/session/${sessionId.current}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ frame, describe }),
-        });
-        const { caption } = await res.json();
-        if (caption) {
-          // Injects context without triggering a reply — the agent just quietly knows.
-          sendContextualUpdate(`[SCREEN] ${caption}`);
-          setObservations((prev) => [...prev.slice(-7), { text: caption, at: Date.now() }]);
+          const { caption } = await res.json();
+          if (caption) {
+            if (FALLBACK_CONTEXT) sendContextualUpdate(`[SCREEN] ${caption}`);
+            setObservations((prev) => [...prev.slice(-7), { text: caption, at: Date.now() }]);
+          }
+        } catch {
+          // A dropped frame is not worth surfacing; the next one is milliseconds away.
+        } finally {
+          inFlight.current -= 1;
         }
-      } catch {
-        // A dropped frame is not worth surfacing; the next tick will retry.
-      } finally {
-        inFlight.current = false;
-      }
-    }, TICK_MS);
+      })();
+    });
 
-    return () => clearInterval(id);
+    return unsubscribe;
   }, [live, sendContextualUpdate]);
 
   return (
     <div className="flex w-full max-w-3xl flex-col gap-6">
-      <div className="flex items-center gap-4">
+      <div className="flex flex-wrap items-center gap-4">
         <button
           onClick={live ? stop : start}
           className={`rounded-full px-8 py-4 text-lg font-medium transition ${
@@ -175,7 +190,8 @@ function CallSurface() {
               <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
               <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-500" />
             </span>
-            {conversation.isSpeaking ? "Agent is speaking" : "Listening and watching"}
+            {conversation.isSpeaking ? "Agent is speaking" : "Watching and listening"}
+            <span className="text-neutral-600">· {frames} frames</span>
           </span>
         )}
       </div>

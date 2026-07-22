@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --test --experimental-strip-types \"tests/*.test.ts\"",
+    "verify": "pnpm test && npx tsc --noEmit && next build"
   },
   "dependencies": {
     "@elevenlabs/react": "^1.10.1",
